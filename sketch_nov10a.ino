@@ -1,18 +1,24 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// --- Pin Definitions ---
-// Stepper Motor Pins
-#define STEP_PIN 12   // STEP -> A4988 STEP
-#define DIR_PIN  13   // DIR  -> A4988 DIR
+// --- PHYSICAL CALIBRATION CONSTANT (CRITICAL! ADJUST FOR YOUR SETUP!) ---
+// This example is for:
+// - A 50mL syringe with a ~30mm inner diameter.
+// - An A4988 driver in FULL-STEP mode (MS pins disconnected).
+// - A 200 step/rev motor.
+// - An 8mm pitch leadscrew.
+// Calculation: (200 steps_per_rev / 8 mm_per_rev) * (1.414 mm_plunger_travel_per_mL) = 35.35
+#define STEPS_PER_ML 35.35 
 
-// Rotary Encoder Pins
-#define CLK_PIN 14
-#define DT_PIN 27
-#define SW_PIN 26
+// --- Pin Definitions ---
+#define STEP_PIN 33
+#define DIR_PIN  32
+#define CLK_PIN  14
+#define DT_PIN   27
+#define SW_PIN   26
 
 // --- LCD I2C Setup ---
-#define LCD_I2C_ADDRESS 0x27 // Change if your address is different
+#define LCD_I2C_ADDRESS 0x27
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, 16, 2);
 
 // --- Encoder and State Variables ---
@@ -20,38 +26,31 @@ int lastClkState;
 unsigned long lastInputTime = 0;
 int menuState = 0; // 0 = main menu, 1 = editing a value
 
-// --- Menu Items ---
-const char* mainMenuItems[] = {"Steps", "Speed (delay)", "Start Motor"};
+// --- Menu Items (Simplified) ---
+const char* mainMenuItems[] = {"Volume (mL)", "Time (min)", "Start Infusion"};
 const int mainMenuItemCount = 3;
 int currentMenuItem = 0;
 
 // --- Value Storage ---
-long stepsToSet = 400;   // Default number of steps
-int speedDelay = 1000;   // Default delay in microseconds (lower value = faster)
+float volumeToSet_mL = 30.0; // Default volume
+int   timeToSet_min = 1;     // Default time
 
 void setup() {
   Serial.begin(115200);
-
-  // --- Initialize LCD ---
   lcd.init();
   lcd.backlight();
 
-  // --- Initialize Pin Modes ---
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
   pinMode(CLK_PIN, INPUT);
   pinMode(DT_PIN, INPUT);
   pinMode(SW_PIN, INPUT_PULLUP);
 
-  // Read initial encoder state
   lastClkState = digitalRead(CLK_PIN);
-
-  // Draw the initial menu screen
   drawMenu();
 }
 
 void loop() {
-  // The program is entirely driven by user input from the encoder
   handleEncoder();
 }
 
@@ -59,94 +58,86 @@ void drawMenu() {
   lcd.clear();
   lcd.setCursor(0, 0);
 
-  if (menuState == 0) { // --- In the Main Menu ---
-    lcd.print("Stepper Control");
+  if (menuState == 0) { // In the Main Menu
+    lcd.print("Syringe Pump");
     lcd.setCursor(0, 1);
     lcd.print(">");
     lcd.print(mainMenuItems[currentMenuItem]);
-
-  } else if (menuState == 1) { // --- In Editing Mode ---
+  } else if (menuState == 1) { // In Editing Mode
     lcd.print("Set ");
     lcd.print(mainMenuItems[currentMenuItem]);
     lcd.setCursor(0, 1);
     lcd.print("Value: ");
-
-    // Display the value being edited
-    if (currentMenuItem == 0) lcd.print(stepsToSet);
-    if (currentMenuItem == 1) lcd.print(speedDelay);
+    if (currentMenuItem == 0) lcd.print(volumeToSet_mL, 1);
+    if (currentMenuItem == 1) lcd.print(timeToSet_min);
   }
 }
 
 void handleEncoder() {
   unsigned long currentTime = millis();
-  // Debounce delay for encoder inputs, 150ms is a good starting point
-  if (currentTime - lastInputTime < 150) {
+  if (currentTime - lastInputTime < 400) return;
+
+  if (digitalRead(SW_PIN) == LOW) {
+    if (menuState == 0) {
+      if (currentMenuItem == 2) { // "Start Infusion" is selected
+        runInfusion();
+      } else {
+        menuState = 1; // Enter editing mode for Volume or Time
+      }
+    } else {
+      menuState = 0; // Exit editing mode
+    }
+    drawMenu();
+    lastInputTime = currentTime + 300;
     return;
   }
 
-  // --- Handle Button Press ---
-  if (digitalRead(SW_PIN) == LOW) {
-    if (menuState == 0) { // If in the main menu...
-      if (currentMenuItem == 2) { // "Start Motor" is selected
-        lcd.clear();
-        lcd.print("Motor Running...");
-        lcd.setCursor(0,1);
-        lcd.print("Steps: " + String(stepsToSet));
-        
-        // Set direction based on the sign of stepsToSet
-        digitalWrite(DIR_PIN, (stepsToSet > 0) ? HIGH : LOW);
-        stepMotor(abs(stepsToSet), speedDelay); // Move the motor
-        
-        delay(500); // Pause briefly after the motor stops
-      } else {
-        // Enter editing mode for "Steps" or "Speed"
-        menuState = 1;
-      }
-    } else { // If in editing mode...
-      // Exit back to the main menu
-      menuState = 0;
-    }
-    
-    drawMenu(); // Redraw the menu after any action
-    lastInputTime = currentTime + 300; // Add extra delay to prevent accidental double press
-    return; // Exit function immediately after handling the click
-  }
-
-  // --- Handle Rotation ---
   int currentClkState = digitalRead(CLK_PIN);
   if (currentClkState != lastClkState) {
     bool movedRight = (digitalRead(DT_PIN) != currentClkState);
-    
-    if (menuState == 0) { // Navigate the main menu
-      if (movedRight) {
-        currentMenuItem = (currentMenuItem + 1) % mainMenuItemCount;
-      } else {
-        currentMenuItem = (currentMenuItem - 1 + mainMenuItemCount) % mainMenuItemCount;
+    if (menuState == 0) {
+      if (movedRight) currentMenuItem = (currentMenuItem + 1) % mainMenuItemCount;
+      else currentMenuItem = (currentMenuItem - 1 + mainMenuItemCount) % mainMenuItemCount;
+    } else {
+      if (currentMenuItem == 0) {
+        if (movedRight) volumeToSet_mL += 1;
+        else volumeToSet_mL -= 1;
+        if (volumeToSet_mL < 0) volumeToSet_mL = 0;
       }
-    } else { // Change values in edit mode
-      if (currentMenuItem == 0) { // Editing "Steps"
-        if (movedRight) stepsToSet += 10;
-        else stepsToSet -= 10;
-      }
-      if (currentMenuItem == 1) { // Editing "Speed (delay)"
-        if (movedRight) {
-          speedDelay -= 100; // DECREASE delay to go FASTER
-        } else {
-          speedDelay += 100; // INCREASE delay to go SLOWER
-        }
-        // Add constraints to prevent stall or extremely slow speed
-        speedDelay = max(400, speedDelay);   // Max speed (400us is very fast)
-        speedDelay = min(10000, speedDelay); // Min speed
+      if (currentMenuItem == 1) {
+        if (movedRight) timeToSet_min += 1;
+        else timeToSet_min -= 1;
+        if (timeToSet_min < 1) timeToSet_min = 1;
       }
     }
-
     drawMenu();
     lastInputTime = currentTime;
   }
   lastClkState = currentClkState;
 }
 
-// Modified stepMotor function now accepts a speed delay value
+void runInfusion() {
+  long totalSteps = round(volumeToSet_mL * STEPS_PER_ML);
+  unsigned long totalTime_us = (unsigned long)timeToSet_min * 60 * 1000000;
+  
+  if (totalSteps <= 0 || totalTime_us <= 0) {
+    lcd.clear(); lcd.print("Invalid values!"); delay(2000); return;
+  }
+  
+  int speedDelay = totalTime_us / (totalSteps * 2);
+
+  lcd.clear();
+  lcd.print("Infusing...");
+  lcd.setCursor(0, 1);
+  lcd.print(String(volumeToSet_mL, 1) + "mL in " + String(timeToSet_min) + "min");
+
+  digitalWrite(DIR_PIN, LOW); // Set direction to dispense fluid
+  
+  stepMotor(totalSteps, speedDelay);
+
+  lcd.clear(); lcd.print("Infusion"); lcd.setCursor(0,1); lcd.print("Complete!"); delay(3000);
+}
+
 void stepMotor(long steps, int delayVal) {
   for (long i = 0; i < steps; i++) {
     digitalWrite(STEP_PIN, HIGH);
